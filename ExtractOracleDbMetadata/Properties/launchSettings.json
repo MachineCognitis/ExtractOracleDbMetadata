@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "ExtractOracleDbMetadata": {
+      "commandName": "Project",
+      "commandLineArgs": "MERCH/merch@srv-db-101/Phoenix C:\\Temp"
+    }
+  }
+}
