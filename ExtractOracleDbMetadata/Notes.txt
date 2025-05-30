@@ -1,0 +1,1 @@
+Publish project to get the portable ExtractOracleDbMetadata.exe

@@ -1,13 +1,440 @@
 ﻿using Oracle.ManagedDataAccess.Client;
-using System.Diagnostics;
 using System.IO.Compression;
 using System.Text.RegularExpressions;
-using System.Text;
 
 namespace ExtractOracleDbMetadata
 {
     internal partial class Program
     {
+        private static readonly string schemasQuery = @"
+--SELECT *
+SELECT
+  XMLELEMENT(""Schemas"", 
+      XMLAGG(
+          XMLELEMENT(""Schema"",
+              XMLFOREST(OWNER AS ""SchemaName"")
+          )
+      )
+  )
+AS XML_RESULT
+FROM (
+    -- List of schemas accessible to current USER.
+    WITH user_schemas AS (
+        SELECT UNIQUE OWNER 
+        FROM ALL_OBJECTS
+        WHERE ORACLE_MAINTAINED = 'N'
+        AND OWNER IN (SELECT USERNAME AS SCHEMA_NAME FROM DBA_USERS WHERE ORACLE_MAINTAINED = 'N')
+        AND OBJECT_TYPE IN ('FUNCTION', 'MATERIALIZED VIEW', 'PACKAGE', 'PACKAGE BODY', 'PROCEDURE', 'SEQUENCE', 'TABLE', 'TYPE', 'VIEW')
+    )
+    SELECT * FROM user_schemas
+)
+";
+
+        private static readonly string typesQuery = @"
+--SELECT t1.TYPE_OWNER, t1.TYPE_NAME, t1.ATTR_TYPE, t1.ATTR_NAME, t1.ATTR_NO, t1.ATTR_TYPE_OWNER, t1.ATTR_TYPE_NAME, t1.LENGTH, t1.PRECISION, t1.SCALE, t2.LEVEL_NO
+SELECT XMLELEMENT(""PLSQLTypes"",
+       XMLAGG(
+           XMLELEMENT(""Type"",
+               XMLATTRIBUTES(
+                   t1.TYPE_OWNER AS ""TypeOwner"",
+                   t1.TYPE_NAME AS ""TypeName"",
+                   t1.ATTR_TYPE AS ""AttrType""
+               ),
+               XMLAGG(
+                   XMLELEMENT(""Member"",
+                       XMLFOREST(
+                           t1.ATTR_NAME AS ""AttrName"",
+                           t1.ATTR_NO AS ""AttrNo"",
+                           t1.ATTR_TYPE_OWNER AS ""AttrTypeOwner"",
+                           t1.ATTR_TYPE_NAME AS ""DataType"",
+                           t1.LENGTH AS ""DataLength"",
+                           t1.PRECISION AS ""DataPrecision"",
+                           t1.SCALE AS ""DataScale"",
+                           t2.LEVEL_NO AS ""LevelNo""
+                       )
+                   ) ORDER BY t1.ATTR_NO
+               )
+           ) ORDER BY LEVEL_NO, t1.TYPE_OWNER, t1.TYPE_NAME
+       )
+) AS xml_output
+FROM
+   (SELECT UPPER(OWNER) TYPE_OWNER, UPPER(TYPE_NAME) TYPE_NAME, UPPER(COLL_TYPE) ATTR_TYPE, NULL ATTR_NAME, 1 ATTR_NO, UPPER(ELEM_TYPE_OWNER) ATTR_TYPE_OWNER, UPPER(ELEM_TYPE_NAME) ATTR_TYPE_NAME, UPPER_BOUND LENGTH, PRECISION, SCALE
+    FROM ALL_COLL_TYPES WHERE COLL_TYPE = 'VARYING ARRAY'
+    UNION ALL
+    SELECT UPPER(OWNER) TYPE_OWNER, UPPER(TYPE_NAME) TYPE_NAME, UPPER(COLL_TYPE) ATTR_TYPE, NULL ATTR_NAME, 1 ATTR_NO, UPPER(ELEM_TYPE_OWNER) ATTR_TYPE_OWNER, UPPER(ELEM_TYPE_NAME) ATTR_TYPE_NAME, LENGTH, PRECISION, SCALE
+    FROM ALL_COLL_TYPES WHERE COLL_TYPE = 'TABLE'
+    UNION ALL
+    SELECT UPPER(OWNER) TYPE_OWNER, UPPER(TYPE_NAME) TYPE_NAME, 'UDT' ATTR_TYPE, ATTR_NAME, ATTR_NO, UPPER(ATTR_TYPE_OWNER) ATTR_TYPE_OWNER, UPPER(ATTR_TYPE_NAME) ATTR_TYPE_NAME, LENGTH, PRECISION, SCALE
+    FROM ALL_TYPE_ATTRS
+    ORDER BY TYPE_NAME, ATTR_NO) t1,
+  (WITH user_schemas AS (
+        SELECT UNIQUE OWNER 
+        FROM ALL_OBJECTS
+        WHERE ORACLE_MAINTAINED = 'N'
+        AND OWNER IN (SELECT USERNAME AS SCHEMA_NAME FROM DBA_USERS WHERE ORACLE_MAINTAINED = 'N')
+        AND OBJECT_TYPE IN ('FUNCTION', 'MATERIALIZED VIEW', 'PACKAGE', 'PACKAGE BODY', 'PROCEDURE', 'SEQUENCE', 'TABLE', 'TYPE', 'VIEW')
+  )
+  --SELECT * FROM user_schemas
+  , all_user_types AS (
+      SELECT UNIQUE UPPER(OWNER) TYPE_OWNER, UPPER(TYPE_NAME) TYPE_NAME FROM ALL_COLL_TYPES WHERE OWNER IN (SELECT OWNER FROM user_schemas)
+      UNION ALL
+      SELECT UNIQUE UPPER(OWNER) TYPE_OWNER, UPPER(TYPE_NAME) TYPE_NAME FROM ALL_TYPE_ATTRS WHERE OWNER IN (SELECT OWNER FROM user_schemas)
+  )
+  --SELECT * FROM all_user_types ORDER BY TYPE_OWNER, TYPE_NAME
+  , dependent_types AS (
+      SELECT TYPE_OWNER, TYPE_NAME, DEPENDENT_TYPE_OWNER, DEPENDENT_TYPE_NAME
+      FROM (
+          SELECT UPPER(OWNER) TYPE_OWNER, 
+                 UPPER(TYPE_NAME) TYPE_NAME, 
+                 UPPER(ATTR_TYPE_NAME) DEPENDENT_TYPE_NAME, 
+                 UPPER(ATTR_TYPE_OWNER) DEPENDENT_TYPE_OWNER 
+          FROM ALL_TYPE_ATTRS
+          WHERE (OWNER, ATTR_TYPE_NAME) IN (SELECT TYPE_OWNER, TYPE_NAME FROM all_user_types)
+          UNION  
+          SELECT UPPER(OWNER) TYPE_OWNER, 
+                 UPPER(TYPE_NAME) TYPE_NAME, 
+                 UPPER(ELEM_TYPE_NAME) DEPENDENT_TYPE_NAME, 
+                 UPPER(ELEM_TYPE_OWNER) DEPENDENT_TYPE_OWNER 
+          FROM ALL_COLL_TYPES
+          WHERE (ELEM_TYPE_OWNER, ELEM_TYPE_NAME) IN (SELECT TYPE_OWNER, TYPE_NAME FROM all_user_types)
+          UNION  
+          SELECT UPPER(OWNER) TYPE_OWNER, 
+                 UPPER(TYPE_NAME) TYPE_NAME, 
+                 NULL DEPENDENT_TYPE_NAME, 
+                 NULL DEPENDENT_TYPE_OWNER 
+          FROM ALL_COLL_TYPES
+          WHERE (UPPER(ELEM_TYPE_OWNER), UPPER(ELEM_TYPE_NAME)) NOT IN (SELECT TYPE_OWNER, TYPE_NAME FROM all_user_types)
+          AND OWNER IN (SELECT OWNER FROM user_schemas)
+          UNION
+          SELECT UPPER(OWNER) TYPE_OWNER, 
+                 UPPER(TYPE_NAME) TYPE_NAME, 
+                 NULL DEPENDENT_TYPE_NAME, 
+                 NULL DEPENDENT_TYPE_OWNER
+          FROM ALL_TYPE_ATTRS
+          WHERE (UPPER(OWNER), UPPER(ATTR_TYPE_NAME)) NOT IN (SELECT TYPE_OWNER, TYPE_NAME FROM all_user_types)
+          AND OWNER IN (SELECT OWNER FROM user_schemas)
+      )
+      --WHERE UPPER(TYPE_OWNER) IN (SELECT UPPER(OWNER) FROM user_schemas)
+  )
+  --SELECT * FROM dependent_types WHERE TYPE_OWNER = 'MERCH' ORDER BY TYPE_OWNER, TYPE_NAME
+  , dependencies AS (
+      SELECT TYPE_OWNER, TYPE_NAME, DEPENDENT_TYPE_OWNER, DEPENDENT_TYPE_NAME FROM dependent_types
+      UNION ALL
+      SELECT DEPENDENT_TYPE_OWNER TYPE_OWNER, DEPENDENT_TYPE_NAME TYPE_NAME, NULL DEPENDENT_TYPE_OWNER, NULL DEPENDENT_TYPE_NAME
+      FROM dependent_types
+      WHERE DEPENDENT_TYPE_OWNER IS NOT NULL
+      AND DEPENDENT_TYPE_NAME IS NOT NULL
+      AND (DEPENDENT_TYPE_OWNER, DEPENDENT_TYPE_NAME) NOT IN (SELECT TYPE_OWNER, TYPE_NAME FROM dependent_types) 
+  )
+  --SELECT * FROM dependencies WHERE TYPE_OWNER = 'MERCH' ORDER BY TYPE_OWNER, TYPE_NAME, DEPENDENT_TYPE_OWNER, DEPENDENT_TYPE_NAME
+  , recursive_sort (type_owner, type_name, dependent_type_owner, dependent_type_name, level_no) AS (
+      -- Base case: Elements with no dependencies
+      SELECT type_owner, type_name, dependent_type_owner, dependent_type_name, 1 AS level_no
+      FROM dependencies
+      WHERE dependent_type_name IS NULL
+
+      UNION ALL
+
+      -- Recursive case: Elements depending on already processed elements
+      SELECT cq.type_owner, cq.type_name, cq.dependent_type_owner, cq.dependent_type_name, rs.level_no + 1
+      FROM dependencies cq
+      INNER JOIN recursive_sort rs ON cq.dependent_type_owner = rs.type_owner AND cq.dependent_type_name = rs.type_name
+  )
+  --SELECT * FROM recursive_sort WHERE TYPE_OWNER = 'MERCH' ORDER BY LEVEL_NO, TYPE_NAME, DEPENDENT_TYPE_NAME
+  SELECT type_owner, type_name, dependent_type_owner, dependent_type_name, level_no
+  FROM (
+    SELECT type_owner, type_name, dependent_type_owner, dependent_type_name, level_no
+    FROM (
+        SELECT type_owner, type_name, dependent_type_owner, dependent_type_name, level_no,
+               ROW_NUMBER() OVER (PARTITION BY type_owner, type_name ORDER BY level_no DESC) AS rn
+        FROM recursive_sort
+    )
+    WHERE rn = 1
+    ORDER BY LEVEL_NO
+  ) --WHERE TYPE_OWNER = 'MERCH'
+) t2
+WHERE T1.TYPE_OWNER = t2.TYPE_OWNER
+AND T1.TYPE_NAME = t2.TYPE_NAME
+GROUP BY LEVEL_NO, t1.TYPE_OWNER, t1.TYPE_NAME, t1.ATTR_TYPE
+--ORDER BY LEVEL_NO, t1.TYPE_OWNER, t1.TYPE_NAME, ATTR_NO
+";
+
+        private static readonly string tablesQuery = @"
+-- Tables, views and materialized views.
+--SELECT *
+SELECT XMLELEMENT(""Tables"",
+       XMLAGG(
+           XMLELEMENT(""Table"",
+               XMLATTRIBUTES(t.OWNER AS ""Schema"", t.TABLE_NAME AS ""TableName""),
+               XMLAGG(
+                   XMLELEMENT(""Column"",
+                       XMLFOREST(
+                           t.COLUMN_NAME AS ""ColumnName"",
+                           t.DATA_TYPE AS ""DataType"",
+                           t.DATA_LENGTH AS ""DataLength"",
+                           t.DATA_PRECISION AS ""DataPrecision"",
+                           t.DATA_SCALE AS ""DataScale"",
+                           t.NULLABLE AS ""Nullable"",
+                           t.IDENTITY_COLUMN AS ""IdentityColumn"",
+                           t.COLUMN_ID AS ""ColumnId""
+                       )
+                   ) ORDER BY t.COLUMN_ID
+               )
+           )
+       )
+) AS xml_output
+FROM (
+    WITH user_schemas AS (
+        SELECT UNIQUE OWNER 
+        FROM ALL_OBJECTS
+        WHERE ORACLE_MAINTAINED = 'N'
+        AND OWNER IN (SELECT USERNAME AS SCHEMA_NAME FROM DBA_USERS WHERE ORACLE_MAINTAINED = 'N')
+        AND OBJECT_TYPE IN ('FUNCTION', 'MATERIALIZED VIEW', 'PACKAGE', 'PACKAGE BODY', 'PROCEDURE', 'SEQUENCE', 'TABLE', 'TYPE', 'VIEW')
+    )
+    SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, NULLABLE, IDENTITY_COLUMN, COLUMN_ID
+    FROM ALL_TAB_COLUMNS
+    WHERE OWNER IN (SELECT OWNER FROM user_schemas)
+) t
+GROUP BY t.OWNER, t.TABLE_NAME
+--ORDER BY t.OWNER, t.TABLE_NAME
+";
+
+        private static readonly string recordsQuery = @"
+--SELECT t1.TYPE_OWNER, t1.PACKAGE_NAME, t1.TYPE_NAME, t1.ATTR_TYPE, t1.ATTR_NAME, t1.ATTR_NO, t1.ATTR_TYPE_OWNER, t1.ATTR_TYPE_NAME, t1.LENGTH, t1.PRECISION, t1.SCALE, t2.LEVEL_NO
+SELECT XMLELEMENT(""PLSQLTypes"",
+       XMLAGG(
+           XMLELEMENT(""Type"",
+               XMLATTRIBUTES(
+                   t1.TYPE_OWNER AS ""TypeOwner"",
+                   t1.PACKAGE_NAME AS ""PackageName"",
+                   t1.TYPE_NAME AS ""TypeName"",
+                   t1.ATTR_TYPE AS ""AttrType""
+               ),
+               XMLAGG(
+                   XMLELEMENT(""Member"",
+                       XMLFOREST(
+                           t1.ATTR_NAME AS ""AttrName"",
+                           t1.ATTR_NO AS ""AttrNo"",
+                           t1.ATTR_TYPE_OWNER AS ""AttrTypeOwner"",
+                           t1.ATTR_TYPE_NAME AS ""DataType"",
+                           t1.LENGTH AS ""DataLength"",
+                           t1.PRECISION AS ""DataPrecision"",
+                           t1.SCALE AS ""DataScale"",
+                           t2.LEVEL_NO AS ""LevelNo""
+                       )
+                   ) ORDER BY t1.ATTR_NO
+               )
+           ) ORDER BY t1.TYPE_OWNER, t1.PACKAGE_NAME, LEVEL_NO
+       )
+) AS xml_output
+FROM
+   (SELECT UPPER(OWNER) TYPE_OWNER, UPPER(PACKAGE_NAME) PACKAGE_NAME, UPPER(TYPE_NAME) TYPE_NAME, UPPER(COLL_TYPE) ATTR_TYPE, NULL ATTR_NAME, 1 ATTR_NO, UPPER(ELEM_TYPE_OWNER) ATTR_TYPE_OWNER, UPPER(ELEM_TYPE_NAME) ATTR_TYPE_NAME, UPPER_BOUND LENGTH, PRECISION, SCALE
+    FROM ALL_PLSQL_COLL_TYPES WHERE COLL_TYPE = 'VARYING ARRAY'
+    UNION ALL
+    SELECT UPPER(OWNER) TYPE_OWNER, UPPER(PACKAGE_NAME) PACKAGE_NAME, UPPER(TYPE_NAME) TYPE_NAME, 'TABLE' ATTR_TYPE, NULL ATTR_NAME, 1 ATTR_NO, UPPER(ELEM_TYPE_OWNER) ATTR_TYPE_OWNER, UPPER(ELEM_TYPE_NAME) ATTR_TYPE_NAME, LENGTH, PRECISION, SCALE
+    FROM ALL_PLSQL_COLL_TYPES WHERE COLL_TYPE IN ('TABLE', 'PL/SQL INDEX TABLE')
+    UNION ALL
+    SELECT UPPER(OWNER) TYPE_OWNER, UPPER(PACKAGE_NAME) PACKAGE_NAME, UPPER(TYPE_NAME) TYPE_NAME, 'UDT' ATTR_TYPE, ATTR_NAME, ATTR_NO, UPPER(ATTR_TYPE_OWNER) ATTR_TYPE_OWNER, UPPER(ATTR_TYPE_NAME) ATTR_TYPE_NAME, LENGTH, PRECISION, SCALE
+    FROM ALL_PLSQL_TYPE_ATTRS WHERE TYPE_NAME NOT LIKE '%\%%' ESCAPE '\'
+    ORDER BY PACKAGE_NAME, TYPE_NAME, ATTR_NO) t1,
+  (WITH user_schemas AS (
+        SELECT UNIQUE OWNER 
+        FROM ALL_OBJECTS
+        WHERE ORACLE_MAINTAINED = 'N'
+        AND OWNER IN (SELECT USERNAME AS SCHEMA_NAME FROM DBA_USERS WHERE ORACLE_MAINTAINED = 'N')
+        AND OBJECT_TYPE IN ('FUNCTION', 'MATERIALIZED VIEW', 'PACKAGE', 'PACKAGE BODY', 'PROCEDURE', 'SEQUENCE', 'TABLE', 'TYPE', 'VIEW')
+  )
+  --SELECT * FROM user_schemas
+  , all_user_types AS (
+      SELECT UNIQUE UPPER(OWNER) TYPE_OWNER, UPPER(PACKAGE_NAME) PACKAGE_NAME, UPPER(TYPE_NAME) TYPE_NAME FROM ALL_PLSQL_COLL_TYPES WHERE OWNER IN (SELECT OWNER FROM user_schemas)
+      UNION ALL
+      SELECT UNIQUE UPPER(OWNER) TYPE_OWNER, UPPER(PACKAGE_NAME) PACKAGE_NAME, UPPER(TYPE_NAME) TYPE_NAME FROM ALL_PLSQL_TYPE_ATTRS WHERE OWNER IN (SELECT OWNER FROM user_schemas)
+  )
+  --SELECT * FROM all_user_types ORDER BY TYPE_OWNER, PACKAGE_NAME, TYPE_NAME
+  , dependent_types AS (
+      SELECT TYPE_OWNER, PACKAGE_NAME, TYPE_NAME, DEPENDENT_TYPE_OWNER, DEPENDENT_TYPE_NAME
+      FROM (
+          SELECT UPPER(OWNER) TYPE_OWNER,
+                 UPPER(PACKAGE_NAME) PACKAGE_NAME,
+                 UPPER(TYPE_NAME) TYPE_NAME,
+                 UPPER(ATTR_TYPE_NAME) DEPENDENT_TYPE_NAME,
+                 UPPER(ATTR_TYPE_OWNER) DEPENDENT_TYPE_OWNER
+          FROM ALL_PLSQL_TYPE_ATTRS
+          WHERE (OWNER, PACKAGE_NAME, ATTR_TYPE_NAME) IN (SELECT TYPE_OWNER, PACKAGE_NAME, TYPE_NAME FROM all_user_types)
+          UNION  
+          SELECT UPPER(OWNER) TYPE_OWNER, 
+                 UPPER(PACKAGE_NAME) PACKAGE_NAME, 
+                 UPPER(TYPE_NAME) TYPE_NAME, 
+                 UPPER(ELEM_TYPE_NAME) DEPENDENT_TYPE_NAME, 
+                 UPPER(ELEM_TYPE_OWNER) DEPENDENT_TYPE_OWNER 
+          FROM ALL_PLSQL_COLL_TYPES
+          WHERE (ELEM_TYPE_OWNER, ELEM_TYPE_PACKAGE, ELEM_TYPE_NAME) IN (SELECT TYPE_OWNER, PACKAGE_NAME, TYPE_NAME FROM all_user_types)
+          UNION  
+          SELECT UPPER(OWNER) TYPE_OWNER, 
+                 UPPER(PACKAGE_NAME) PACKAGE_NAME, 
+                 UPPER(TYPE_NAME) TYPE_NAME, 
+                 NULL DEPENDENT_TYPE_NAME, 
+                 NULL DEPENDENT_TYPE_OWNER
+          FROM ALL_PLSQL_COLL_TYPES
+          WHERE (UPPER(ELEM_TYPE_OWNER), UPPER(PACKAGE_NAME), UPPER(ELEM_TYPE_NAME)) NOT IN (SELECT TYPE_OWNER, PACKAGE_NAME, TYPE_NAME FROM all_user_types)
+          AND OWNER IN (SELECT OWNER FROM user_schemas)
+          UNION  
+          SELECT UPPER(OWNER) TYPE_OWNER, 
+                 UPPER(PACKAGE_NAME) PACKAGE_NAME, 
+                 UPPER(TYPE_NAME) TYPE_NAME, 
+                 NULL DEPENDENT_TYPE_NAME, 
+                 NULL DEPENDENT_TYPE_OWNER 
+          FROM ALL_PLSQL_TYPE_ATTRS
+          WHERE (UPPER(OWNER), UPPER(PACKAGE_NAME), UPPER(ATTR_TYPE_NAME)) NOT IN (SELECT TYPE_OWNER, PACKAGE_NAME, TYPE_NAME FROM all_user_types)
+          AND OWNER IN (SELECT OWNER FROM user_schemas)
+      )
+      --WHERE UPPER(TYPE_OWNER) IN (SELECT UPPER(OWNER) FROM user_schemas)
+  )
+  --SELECT * FROM dependent_types WHERE TYPE_OWNER = 'MERCH' ORDER BY TYPE_OWNER, PACKAGE_NAME, TYPE_NAME
+  , dependencies AS (
+      SELECT TYPE_OWNER, PACKAGE_NAME, TYPE_NAME, DEPENDENT_TYPE_OWNER, DEPENDENT_TYPE_NAME FROM dependent_types
+      UNION ALL
+      SELECT DEPENDENT_TYPE_OWNER TYPE_OWNER, PACKAGE_NAME, DEPENDENT_TYPE_NAME TYPE_NAME, NULL DEPENDENT_TYPE_OWNER, NULL DEPENDENT_TYPE_NAME
+      FROM dependent_types
+      WHERE DEPENDENT_TYPE_OWNER IS NOT NULL
+      AND DEPENDENT_TYPE_NAME IS NOT NULL
+      AND (DEPENDENT_TYPE_OWNER, PACKAGE_NAME, DEPENDENT_TYPE_NAME) NOT IN (SELECT TYPE_OWNER, PACKAGE_NAME, TYPE_NAME FROM dependent_types) 
+  )
+  --SELECT * FROM dependencies WHERE TYPE_OWNER = 'MERCH' ORDER BY TYPE_OWNER, TYPE_NAME, DEPENDENT_TYPE_OWNER, DEPENDENT_TYPE_NAME
+  , recursive_sort (type_owner, package_name, type_name, dependent_type_owner, dependent_type_name, level_no) AS (
+      -- Base case: Elements with no dependencies
+      SELECT type_owner, package_name, type_name, dependent_type_name, dependent_type_owner, 1 AS level_no
+      FROM dependencies
+      WHERE dependent_type_name IS NULL
+
+      UNION ALL
+
+      -- Recursive case: Elements depending on already processed elements
+      SELECT cq.type_owner, cq.package_name, cq.type_name, cq.dependent_type_name, cq.dependent_type_owner, rs.level_no + 1
+      FROM dependencies cq
+      INNER JOIN recursive_sort rs ON cq.dependent_type_owner = rs.type_owner AND cq.dependent_type_owner = rs.type_owner AND cq.dependent_type_name = rs.type_name
+  )
+  --SELECT * FROM recursive_sort WHERE TYPE_OWNER = 'MERCH' ORDER BY LEVEL_NO, TYPE_NAME, DEPENDENT_TYPE_NAME
+  SELECT type_owner, package_name, type_name, dependent_type_owner, dependent_type_name, level_no
+  FROM (
+    SELECT type_owner, package_name, type_name, dependent_type_owner, dependent_type_name, level_no
+    FROM (
+        SELECT type_owner, package_name, type_name, dependent_type_owner, dependent_type_name, level_no,
+               ROW_NUMBER() OVER (PARTITION BY type_owner, package_name, type_name ORDER BY level_no DESC) AS rn
+        FROM recursive_sort
+    )
+    WHERE rn = 1
+    ORDER BY LEVEL_NO
+  ) --WHERE TYPE_OWNER = 'MERCH'
+) t2
+WHERE T1.TYPE_OWNER = t2.TYPE_OWNER
+AND T1.PACKAGE_NAME = t2.PACKAGE_NAME
+AND T1.TYPE_NAME = t2.TYPE_NAME
+GROUP BY t1.TYPE_OWNER, t1.PACKAGE_NAME, t2.LEVEL_NO, t1.TYPE_NAME, t1.ATTR_TYPE
+--ORDER BY t1.TYPE_OWNER, t1.PACKAGE_NAME, LEVEL_NO, t1.TYPE_NAME, t1.ATTR_NO
+";
+
+        private static readonly string proceduresQuery = @"
+--SELECT *
+SELECT XMLELEMENT(""Objects"",
+       XMLAGG(
+           XMLELEMENT(""Object"",
+               XMLATTRIBUTES(t.OWNER AS ""Schema"", t.PACKAGE_NAME AS ""PackageName"", t.OBJECT_NAME AS ""ObjectName""),
+               XMLAGG(
+                   XMLELEMENT(""Argument"",
+                       XMLFOREST(
+                           t.ARGUMENT_NAME AS ""ArgumentName"",
+                           t.DATA_TYPE AS ""DataType"",
+                           t.IN_OUT AS ""InOut"",
+                           t.DATA_LENGTH AS ""DataLength"",
+                           t.DATA_PRECISION AS ""DataPrecision"",
+                           t.DATA_SCALE AS ""DataScale"",
+                           t.TYPE_OWNER AS ""TypeOwner"",
+                           t.TYPE_NAME AS ""TypeName"",
+                           t.TYPE_SUBNAME AS ""TypeSubname"",
+                           t.TYPE_OBJECT_TYPE AS ""TypeObjectType"",
+                           t.PLS_TYPE AS ""PlsType""
+                       )
+                   ) ORDER BY t.POSITION
+               )
+           ) ORDER BY t.OWNER, t.PACKAGE_NAME -- Ordering by schema first, then package name
+       )
+) AS xml_output
+FROM (
+    -- Your existing query logic here
+    WITH user_schemas AS (
+        SELECT UNIQUE OWNER 
+        FROM ALL_OBJECTS
+        WHERE ORACLE_MAINTAINED = 'N'
+        AND OWNER IN (SELECT USERNAME AS SCHEMA_NAME FROM DBA_USERS WHERE ORACLE_MAINTAINED = 'N')
+        AND OBJECT_TYPE IN ('FUNCTION', 'MATERIALIZED VIEW', 'PACKAGE', 'PACKAGE BODY', 'PROCEDURE', 'SEQUENCE', 'TABLE', 'TYPE', 'VIEW')
+    )
+    SELECT OWNER, PACKAGE_NAME, OBJECT_NAME, OVERLOAD, ARGUMENT_NAME, DATA_TYPE, IN_OUT, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, POSITION, TYPE_OWNER, TYPE_NAME, TYPE_SUBNAME, TYPE_OBJECT_TYPE, PLS_TYPE
+    FROM ALL_ARGUMENTS
+    WHERE OWNER IN (SELECT OWNER FROM user_schemas)
+) t
+GROUP BY t.OWNER, t.PACKAGE_NAME, t.OBJECT_NAME, t.OVERLOAD
+--ORDER BY t.OWNER, t.PACKAGE_NAME, t.OBJECT_NAME, t.OVERLOAD
+";
+
+        private static readonly string sequencesQuery = @"
+--SELECT *
+SELECT XMLELEMENT(""Sequences"",
+       XMLAGG(
+           XMLELEMENT(""Sequence"",
+               XMLATTRIBUTES(t.SEQUENCE_OWNER AS ""Schema"", t.SEQUENCE_NAME AS ""SequenceName""),
+               XMLFOREST(
+                   t.MIN_VALUE AS ""MinValue"",
+                   t.MAX_VALUE AS ""MaxValue"",
+                   t.INCREMENT_BY AS ""IncrementBy"",
+                   t.CYCLE_FLAG AS ""CycleFlag"",
+                   t.ORDER_FLAG AS ""OrderFlag"",
+                   t.CACHE_SIZE AS ""CacheSize"",
+                   t.LAST_NUMBER AS ""LastNumber""
+               )
+           ) ORDER BY t.SEQUENCE_OWNER, t.SEQUENCE_NAME
+       )
+) AS xml_output
+FROM (
+    WITH user_schemas AS (
+        SELECT UNIQUE OWNER 
+        FROM ALL_OBJECTS
+        WHERE ORACLE_MAINTAINED = 'N'
+        AND OWNER IN (SELECT USERNAME AS SCHEMA_NAME FROM DBA_USERS WHERE ORACLE_MAINTAINED = 'N')
+        AND OBJECT_TYPE IN ('FUNCTION', 'MATERIALIZED VIEW', 'PACKAGE', 'PACKAGE BODY', 'PROCEDURE', 'SEQUENCE', 'TABLE', 'TYPE', 'VIEW')
+    )
+    SELECT SEQUENCE_OWNER, SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY, CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE, LAST_NUMBER
+    FROM ALL_SEQUENCES
+    WHERE SEQUENCE_OWNER IN (SELECT OWNER FROM user_schemas)
+    AND SEQUENCE_NAME NOT LIKE 'ISEQ$$%'
+) t
+--ORDER BY t.SEQUENCE_OWNER, t.SEQUENCE_NAME
+";
+
+        private static readonly string synonymsQuery = @"
+--SELECT *
+SELECT XMLELEMENT(""Synonyms"",
+       XMLAGG(
+           XMLELEMENT(""Synonym"",
+               XMLATTRIBUTES(t.OWNER AS ""Schema"", t.SYNONYM_NAME AS ""SynonymName"", t.TABLE_OWNER AS ""ObjectOwner"", t.TABLE_NAME AS ""ObjectName"", t.DB_LINK AS ""DbLink"")
+           ) ORDER BY t.OWNER, t.SYNONYM_NAME
+       )
+) AS xml_output
+FROM (
+    WITH user_schemas AS (
+        SELECT UNIQUE OWNER 
+        FROM ALL_OBJECTS
+        WHERE ORACLE_MAINTAINED = 'N'
+        AND OWNER IN (SELECT USERNAME AS SCHEMA_NAME FROM DBA_USERS WHERE ORACLE_MAINTAINED = 'N')
+        AND OBJECT_TYPE IN ('FUNCTION', 'MATERIALIZED VIEW', 'PACKAGE', 'PACKAGE BODY', 'PROCEDURE', 'SEQUENCE', 'TABLE', 'TYPE', 'VIEW')
+    )
+    SELECT *
+    FROM ALL_SYNONYMS
+    WHERE OWNER IN (SELECT OWNER FROM user_schemas)
+) t
+--ORDER BY t.SEQUENCE_OWNER, t.SEQUENCE_NAME
+";
+
         [GeneratedRegex("^((?<user>[^/]+)/(?<password>[^@]+)@(?<host>[^:/]+)(:(?<port>[0-9]+))?/(?<server>[^/]+))$")]
         private static partial Regex DbConnectionRegex();
 
@@ -40,11 +467,7 @@ namespace ExtractOracleDbMetadata
 
             try
             {
-                string query;
-                string outputFilePath;
-                PlSqlUnwrapper.Encoding = GetDbEncoding(connectionString);
-
-                // Check if the output folder exists
+                // Check if the output folder exists.
                 if (!Directory.Exists(args[1]))
                     Directory.CreateDirectory(args[1]);
 
@@ -53,213 +476,17 @@ namespace ExtractOracleDbMetadata
 
                 Directory.CreateDirectory(uniqueFolder);
 
-                Console.WriteLine("Extracting tables metadata...");
-
-                query = @"SELECT TABLE_NAME, COLUMN_NAME,DATA_TYPE, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, NULLABLE, IDENTITY_COLUMN
-                                 FROM USER_TAB_COLUMNS
-                                 ORDER BY TABLE_NAME, COLUMN_ID";
-                outputFilePath = $@"{uniqueFolder}\Tables.csv";
-                ExtractData(connectionString, query, outputFilePath);
-                //OpenFile(outputFilePath);
-
-                query = $@"SELECT '<BEGIN>', DBMS_METADATA.GET_DDL('TABLE', table_name, owner), '<END>' DDL
-                           FROM ALL_TABLES
-                           WHERE OWNER = '{user}'";
-                outputFilePath = $@"{uniqueFolder}\Tables_DDL.txt";
-                ExtractData(connectionString, query, outputFilePath, writeColumnNames: false);
-                //OpenFile(outputFilePath);
-
-                Console.WriteLine("Extracting sequences metadata...");
-
-                query = $@"SELECT '<BEGIN>', DBMS_METADATA.GET_DDL('SEQUENCE', sequence_name, sequence_owner), '<END>' DDL
-                           FROM ALL_SEQUENCES
-                           WHERE SEQUENCE_OWNER = '{user}'
-                           AND SEQUENCE_NAME NOT LIKE 'ISEQ$$%'";
-                outputFilePath = $@"{uniqueFolder}\Sequences_DDL.txt";
-                ExtractData(connectionString, query, outputFilePath, writeColumnNames: false, RemovePlSqlComments);
-                //OpenFile(outputFilePath);
-
-                //Console.WriteLine("Extracting materialized views metadata...");
-
-                //query = $@"SELECT '<BEGIN>', DBMS_METADATA.GET_DDL('MATERIALIZED_VIEW', mview_name, owner), '<END>' DDL
-                //           FROM ALL_MVIEWS
-                //           WHERE OWNER = '{user}'";
-                //outputFilePath = $@"{uniqueFolder}\MaterializedViews_DDL.txt";
-                //ExtractData(connectionString, query, outputFilePath, writeColumnNames: false, RemovePlSqlComments);
-                ////OpenFile(outputFilePath);
-
-                //Console.WriteLine("Extracting views metadata...");
-
-                //query = $@"SELECT '<BEGIN>', DBMS_METADATA.GET_DDL('VIEW', view_name, owner), '<END>' DDL
-                //           FROM ALL_VIEWS
-                //           WHERE OWNER = '{user}'";
-                //outputFilePath = $@"{uniqueFolder}\Views_DDL.txt";
-                //ExtractData(connectionString, query, outputFilePath, writeColumnNames: false, filter: RemovePlSqlComments);
-                ////OpenFile(outputFilePath);
-
-                Console.WriteLine("Extracting procedures metadata...");
-
-                query = @"SELECT PACKAGE_NAME, OBJECT_NAME, ARGUMENT_NAME, DATA_TYPE, IN_OUT, DATA_LENGTH, DATA_PRECISION, DATA_SCALE
-                          FROM USER_ARGUMENTS
-                          ORDER BY PACKAGE_NAME, OBJECT_NAME, POSITION";
-                outputFilePath = $@"{uniqueFolder}\Procedures.csv";
-                ExtractData(connectionString, query, outputFilePath);
-                //OpenFile(outputFilePath);
-
-                query = $@"SELECT '<BEGIN>', DBMS_METADATA.GET_DDL('PROCEDURE', object_name, owner), '<END>' DDL
-                           FROM ALL_OBJECTS
-                           WHERE OWNER = '{user}' AND OBJECT_TYPE = 'PROCEDURE'";
-                outputFilePath = $@"{uniqueFolder}\Procedures_DDL.txt";
-                ExtractData(connectionString, query, outputFilePath, writeColumnNames: false, RemovePlSqlComments, UnwrapCode, RemovePlSqlComments, RemoveProcedureBody, CollapseBlankLines);
-                //OpenFile(outputFilePath);
-
-                Console.WriteLine("Extracting functions metadata...");
-
-                query = $@"SELECT '<BEGIN>', DBMS_METADATA.GET_DDL('FUNCTION', object_name, owner), '<END>' DDL
-                           FROM ALL_OBJECTS
-                           WHERE OWNER = '{user}' AND OBJECT_TYPE = 'FUNCTION'";
-                outputFilePath = $@"{uniqueFolder}\Functions_DDL.txt";
-                ExtractData(connectionString, query, outputFilePath, writeColumnNames: false, RemovePlSqlComments, UnwrapCode, RemovePlSqlComments, RemoveFunctionBody, CollapseBlankLines);
-                //OpenFile(outputFilePath);
-
-                Console.WriteLine("Extracting packages metadata...");
-
-                query = $@"SELECT '<BEGIN>', DBMS_METADATA.GET_DDL('PACKAGE', object_name, owner), '<END>' DDL
-                           FROM ALL_OBJECTS
-                           WHERE OWNER = '{user}' AND OBJECT_TYPE = 'PACKAGE'";
-                outputFilePath = $@"{uniqueFolder}\Packages_DDL.txt";
-                ExtractData(connectionString, query, outputFilePath, writeColumnNames: false, RemovePlSqlComments, RemovePackageBody, RemovePlSqlComments, CollapseBlankLines);
-                //OpenFile(outputFilePath);
-
-                Console.WriteLine("Extracting types metadata...");
-
-                query = @"SELECT t1.TYPE_NAME, t1.ATTR_TYPE, t1.ATTR_NAME, t1.ATTR_NO, t1.ATTR_TYPE_NAME, t1.LENGTH, t1.PRECISION, t1.SCALE, t2.LEVEL_NO
-                          FROM
-                             (SELECT TYPE_NAME, COLL_TYPE ATTR_TYPE, NULL ATTR_NAME, 1 ATTR_NO, ELEM_TYPE_NAME ATTR_TYPE_NAME, LENGTH, PRECISION, SCALE
-                              FROM USER_COLL_TYPES
-                              UNION ALL
-                              SELECT TYPE_NAME, 'UDT' ATTR_TYPE, ATTR_NAME, ATTR_NO, ATTR_TYPE_NAME, LENGTH, PRECISION, SCALE
-                              FROM USER_TYPE_ATTRS
-                              ORDER BY TYPE_NAME, ATTR_NO) t1, 
-                             (WITH coll_types AS (
-                                  SELECT UNIQUE TYPE_NAME FROM USER_COLL_TYPES UNION ALL SELECT UNIQUE TYPE_NAME FROM USER_TYPE_ATTRS
-                              ),
-                              dependent_types AS (
-                                  SELECT TYPE_NAME element_name, dependency_name
-                                  FROM (
-                                        SELECT TYPE_NAME, ATTR_TYPE_NAME DEPENDENCY_NAME FROM USER_TYPE_ATTRS
-                                        WHERE ATTR_TYPE_NAME IN (SELECT * FROM coll_types)
-                                        UNION ALL  
-                                        SELECT TYPE_NAME, ELEM_TYPE_NAME DEPENDENCY_NAME FROM USER_COLL_TYPES
-                                        WHERE ELEM_TYPE_NAME IN (SELECT * FROM coll_types)
-                                        UNION ALL  
-                                        SELECT TYPE_NAME, NULL DEPENDENCY_NAME FROM USER_COLL_TYPES
-                                        WHERE ELEM_TYPE_NAME NOT IN (SELECT * FROM coll_types)
-                                  )
-                              )
-                              --SELECT * FROM dependent_types
-                              ,
-                              dependencies AS (
-                                  SELECT * FROM dependent_types
-                                  UNION ALL
-                                  SELECT DEPENDENCY_NAME element_name, NULL
-                                  FROM dependent_types
-                                  WHERE DEPENDENCY_NAME NOT IN (SELECT element_name FROM dependent_types) 
-                              )
-                              --SELECT * FROM dependent_types
-                              ,
-                              recursive_sort (element_name, dependency_name, level_no) AS (
-                                  -- Base case: Elements with no dependencies
-                                  SELECT element_name, dependency_name, 1 AS level_no
-                                  FROM dependencies
-                                  WHERE dependency_name IS NULL
-
-                                  UNION ALL
-
-                                  -- Recursive case: Elements depending on already processed elements
-                                  SELECT cq.element_name, cq.dependency_name, rs.level_no + 1
-                                  FROM dependencies cq
-                                  INNER JOIN recursive_sort rs ON cq.dependency_name = rs.element_name
-                              )
-                              --SELECT DBMS_METADATA.GET_DDL('TYPE', element_name, 'MERCH')
-                              SELECT element_name, dependency_name, level_no
-                              FROM (
-                                SELECT element_name, dependency_name, level_no
-                                FROM (
-                                    SELECT element_name, dependency_name, level_no,
-                                           ROW_NUMBER() OVER (PARTITION BY element_name ORDER BY level_no DESC) AS rn
-                                    FROM recursive_sort
-                                --    WHERE element_name = dependency_name
-                                ) subquery
-                                WHERE rn = 1
-                                ORDER BY LEVEL_NO
-                              )) t2
-                          WHERE T1.TYPE_NAME = t2.element_name
-                          ORDER BY LEVEL_NO, TYPE_NAME, ATTR_NO";
-                outputFilePath = $@"{uniqueFolder}\Types.csv";
-                ExtractData(connectionString, query, outputFilePath);
-                //OpenFile(outputFilePath);
-
-                query = $@"WITH coll_types AS (
-                               SELECT UNIQUE TYPE_NAME FROM USER_COLL_TYPES UNION ALL SELECT UNIQUE TYPE_NAME FROM USER_TYPE_ATTRS
-                           ),
-                           dependent_types AS (
-                               SELECT TYPE_NAME element_name, dependency_name
-                               FROM (
-                                     SELECT TYPE_NAME, ATTR_TYPE_NAME DEPENDENCY_NAME FROM USER_TYPE_ATTRS
-                                     WHERE ATTR_TYPE_NAME IN (SELECT * FROM coll_types)
-                                     UNION ALL  
-                                     SELECT TYPE_NAME, ELEM_TYPE_NAME DEPENDENCY_NAME FROM USER_COLL_TYPES
-                                     WHERE ELEM_TYPE_NAME IN (SELECT * FROM coll_types)
-                                     UNION ALL  
-                                     SELECT TYPE_NAME, NULL DEPENDENCY_NAME FROM USER_COLL_TYPES
-                                     WHERE ELEM_TYPE_NAME NOT IN (SELECT * FROM coll_types)
-                               )
-                           )
-                           --SELECT * FROM dependent_types
-                           ,
-                           dependencies AS (
-                               SELECT * FROM dependent_types
-                               UNION ALL
-                               SELECT DEPENDENCY_NAME element_name, NULL
-                               FROM dependent_types
-                               WHERE DEPENDENCY_NAME NOT IN (SELECT element_name FROM dependent_types) 
-                           )
-                           --SELECT * FROM dependent_types
-                           ,
-                           recursive_sort (element_name, dependency_name, level_no) AS (
-                               -- Base case: Elements with no dependencies
-                               SELECT element_name, dependency_name, 1 AS level_no
-                               FROM dependencies
-                               WHERE dependency_name IS NULL
-
-                               UNION ALL
-
-                               -- Recursive case: Elements depending on already processed elements
-                               SELECT cq.element_name, cq.dependency_name, rs.level_no + 1
-                               FROM dependencies cq
-                               INNER JOIN recursive_sort rs ON cq.dependency_name = rs.element_name
-                           )
-                           SELECT '<BEGIN>', DBMS_METADATA.GET_DDL('TYPE', element_name, 'MERCH'), '<END>' DDL
-                           --SELECT element_name, dependency_name, level_no
-                           FROM (
-                             SELECT element_name, dependency_name, level_no
-                             FROM (
-                                 SELECT element_name, dependency_name, level_no,
-                                        ROW_NUMBER() OVER (PARTITION BY element_name ORDER BY level_no DESC) AS rn
-                                 FROM recursive_sort
-                             --    WHERE element_name = dependency_name
-                             ) subquery
-                             WHERE rn = 1
-                             ORDER BY LEVEL_NO
-                           )";
-                outputFilePath = $@"{uniqueFolder}\Types_DDL.txt";
-                ExtractData(connectionString, query, outputFilePath, writeColumnNames: false, RemovePlSqlComments);
-                //OpenFile(outputFilePath);
+                ExtractMetadata("schemas", schemasQuery, connectionString, uniqueFolder);
+                ExtractMetadata("types", typesQuery, connectionString, uniqueFolder);
+                ExtractMetadata("tables", tablesQuery, connectionString, uniqueFolder);
+                ExtractMetadata("records", recordsQuery, connectionString, uniqueFolder);
+                ExtractMetadata("procedures", proceduresQuery, connectionString, uniqueFolder);
+                ExtractMetadata("sequences", sequencesQuery, connectionString, uniqueFolder);
+                ExtractMetadata("synonyms", synonymsQuery, connectionString, uniqueFolder);
 
                 ZipSelectedFiles(uniqueFolder, $@"{args[1]}\DbMetadata_{DateTime.Now:yyyy-MM-dd_HH.mm.ss}.zip");
 
-                // Clean up and remove the folder and its contents
+                // Clean up and remove the folder and its contents.
                 Directory.Delete(uniqueFolder, true);
             }
             catch (Exception ex)
@@ -268,58 +495,20 @@ namespace ExtractOracleDbMetadata
             }
         }
 
-        private static void ExtractData(string connectionString, string query, string outputFilePath, bool writeColumnNames = true, params Func<string, string>[] filters)
+        private static void ExtractMetadata(string name, string sqlQuery, string connectionString, string outputFilePath)
         {
-            using StreamWriter writer = new(outputFilePath);
+            Console.WriteLine($"Extracting {name} metadata...");
+
             using OracleConnection connection = new(connectionString);
             connection.Open();
 
-            using OracleCommand command = new(query, connection);
+            using OracleCommand command = new(sqlQuery, connection);
             using OracleDataReader reader = command.ExecuteReader();
 
-            while (reader.Read())
-            {
-                if (writeColumnNames)
-                {
-                    List<string> columnNames = [];
-                    for (int i = 0; i < reader.FieldCount; i++)
-                        columnNames.Add(reader.GetName(i));
-                    writer.WriteLine(string.Join(',', columnNames));
+            reader.Read();
+            string value = "<?xml version=\"1.0\"?>" + reader[0]?.ToString() ?? "";
 
-                    writeColumnNames = false;
-                }
-                // Loop through all columns in the current row
-                List<string> values = [];
-                for (int i = 0; i < reader.FieldCount; i++)
-                {
-                    string value = reader[i]?.ToString() ?? "";
-                    foreach (Func<string, string> filter in filters)
-                        value = filter(value);
-                    values.Add(value);
-                }
-                writer.WriteLine(string.Join(',', values));
-            }
-        }
-
-        private static Encoding GetDbEncoding(string connectionString)
-        {
-            using OracleConnection connection = new(connectionString);
-            connection.Open();
-
-            using OracleCommand command = new("SELECT VALUE FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'", connection);
-            string nlsCharacterSet = (string)command.ExecuteScalar();
-
-            return nlsCharacterSet switch
-            {
-                "AL32UTF8" or "UTF8" => Encoding.UTF8,
-                "WE8ISO8859P1" => Encoding.Latin1,
-                "US7ASCII" => Encoding.ASCII,
-                "CL8MSWIN1251" => Encoding.GetEncoding(1251),
-                "CL8MSWIN1252" => Encoding.GetEncoding(1252),
-                "JA16SJIS" => Encoding.GetEncoding("Shift_JIS"),
-                "ZHS16GBK" => Encoding.GetEncoding("GBK"),
-                _ => throw new InvalidDataException($"Unsupported NLS_CHARACTERSET: {nlsCharacterSet}"),
-            };
+            File.WriteAllText(Path.Combine(outputFilePath, $"{name}.xml"), value);
         }
 
         static void ZipSelectedFiles(string folderPath, string zipPath)
@@ -329,135 +518,11 @@ namespace ExtractOracleDbMetadata
 
             using FileStream zipStream = new(zipPath, FileMode.Create);
             using ZipArchive archive = new(zipStream, ZipArchiveMode.Create);
-            foreach (string file in Directory.GetFiles(folderPath, "*.txt")
-                .Concat(Directory.GetFiles(folderPath, "*.csv")))
+            foreach (string file in Directory.GetFiles(folderPath, "*.xml"))
             {
                 archive.CreateEntryFromFile(file, Path.GetFileName(file));
             }
         }
 
-        private static void OpenFile(string filePath)
-        {
-            ProcessStartInfo startInfo = new(filePath)
-            {
-                UseShellExecute = true
-            };
-            Process.Start(startInfo);
-        }
-
-        static string RemovePlSqlComments(string input)
-        {
-            string pattern1 = @"--.*?$";
-            string pattern2 = @"\/\*.*?\*\/";
-            input = Regex.Replace(input, pattern1, "", RegexOptions.Multiline | RegexOptions.IgnoreCase);
-            return Regex.Replace(input, pattern2, "", RegexOptions.Singleline | RegexOptions.IgnoreCase);
-        }
-
-        static string UnwrapCode(string input)
-        {
-            if (input.Contains("wrapped"))
-            {
-                string[] wrappedCodes = input.Split("wrapped");
-                StringBuilder result = new();
-
-                for (int i = 1; i < wrappedCodes.Length; i++)
-                {
-                    string[] wrapped = wrappedCodes[i].Split(",<END>");
-                    string unwrapped = PlSqlUnwrapper.Unwrap("wrapped" + UnwrapCode(wrapped[0]).TrimEnd());
-                    result.Append(input.Replace("wrapped" + wrapped[0], unwrapped));
-                }
-
-                return result.ToString();
-            }
-
-            return input;
-        }
-
-        static string RemovePackageBody(string input)
-        {
-            string pattern = @"CREATE.+PACKAGE\sBODY";
-            Match match = Regex.Match(input, pattern, RegexOptions.IgnoreCase);
-            if (match.Success)
-                return input[..match.Index];
-
-            return input;
-        }
-
-        static string RemoveProcedureBody(string input)
-        {
-            string pattern = @"(\)|\s)(AS|IS)\s+";
-            Match match = Regex.Match(input, pattern, RegexOptions.IgnoreCase);
-            if (match.Success)
-            {
-                if (input[match.Index] == ')')
-                    return input[..(match.Index + 1)];
-                else
-                    return input[..match.Index];
-            }
-
-            return input;
-        }
-
-        static string RemoveFunctionBody(string input)
-        {
-            string pattern = @"\s+(AS|IS)\s+";
-            Match match = Regex.Match(input, pattern, RegexOptions.IgnoreCase);
-            if (match.Success)
-                return input[..match.Index];
-
-            return input;
-        }
-
-        static string CollapseBlankLines(string input)
-        {
-            string pattern = @"(\r?\n){2,}";
-            return Regex.Replace(input, pattern, "\n", RegexOptions.Singleline | RegexOptions.IgnoreCase);
-        }
-
-        private static class PlSqlUnwrapper
-        {
-            public static Encoding Encoding { get; set; } = Encoding.UTF8;
-
-            private static readonly byte[] substitutionTable =
-            [
-                0x3D, 0x65, 0x85, 0xB3, 0x18, 0xDB, 0xE2, 0x87, 0xF1, 0x52, 0xAB, 0x63, 0x4B, 0xB5, 0xA0, 0x5F,
-                0x7D, 0x68, 0x7B, 0x9B, 0x24, 0xC2, 0x28, 0x67, 0x8A, 0xDE, 0xA4, 0x26, 0x1E, 0x03, 0xEB, 0x17,
-                0x6F, 0x34, 0x3E, 0x7A, 0x3F, 0xD2, 0xA9, 0x6A, 0x0F, 0xE9, 0x35, 0x56, 0x1F, 0xB1, 0x4D, 0x10,
-                0x78, 0xD9, 0x75, 0xF6, 0xBC, 0x41, 0x04, 0x81, 0x61, 0x06, 0xF9, 0xAD, 0xD6, 0xD5, 0x29, 0x7E,
-                0x86, 0x9E, 0x79, 0xE5, 0x05, 0xBA, 0x84, 0xCC, 0x6E, 0x27, 0x8E, 0xB0, 0x5D, 0xA8, 0xF3, 0x9F,
-                0xD0, 0xA2, 0x71, 0xB8, 0x58, 0xDD, 0x2C, 0x38, 0x99, 0x4C, 0x48, 0x07, 0x55, 0xE4, 0x53, 0x8C,
-                0x46, 0xB6, 0x2D, 0xA5, 0xAF, 0x32, 0x22, 0x40, 0xDC, 0x50, 0xC3, 0xA1, 0x25, 0x8B, 0x9C, 0x16,
-                0x60, 0x5C, 0xCF, 0xFD, 0x0C, 0x98, 0x1C, 0xD4, 0x37, 0x6D, 0x3C, 0x3A, 0x30, 0xE8, 0x6C, 0x31,
-                0x47, 0xF5, 0x33, 0xDA, 0x43, 0xC8, 0xE3, 0x5E, 0x19, 0x94, 0xEC, 0xE6, 0xA3, 0x95, 0x14, 0xE0,
-                0x9D, 0x64, 0xFA, 0x59, 0x15, 0xC5, 0x2F, 0xCA, 0xBB, 0x0B, 0xDF, 0xF2, 0x97, 0xBF, 0x0A, 0x76,
-                0xB4, 0x49, 0x44, 0x5A, 0x1D, 0xF0, 0x00, 0x96, 0x21, 0x80, 0x7F, 0x1A, 0x82, 0x39, 0x4F, 0xC1,
-                0xA7, 0xD7, 0x0D, 0xD1, 0xD8, 0xFF, 0x13, 0x93, 0x70, 0xEE, 0x5B, 0xEF, 0xBE, 0x09, 0xB9, 0x77,
-                0x72, 0xE7, 0xB2, 0x54, 0xB7, 0x2A, 0xC7, 0x73, 0x90, 0x66, 0x20, 0x0E, 0x51, 0xED, 0xF8, 0x7C,
-                0x8F, 0x2E, 0xF4, 0x12, 0xC6, 0x2B, 0x83, 0xCD, 0xAC, 0xCB, 0x3B, 0xC4, 0x4E, 0xC0, 0x69, 0x36,
-                0x62, 0x02, 0xAE, 0x88, 0xFC, 0xAA, 0x42, 0x08, 0xA6, 0x45, 0x57, 0xD3, 0x9A, 0xBD, 0xE1, 0x23,
-                0x8D, 0x92, 0x4A, 0x11, 0x89, 0x74, 0x6B, 0x91, 0xFB, 0xFE, 0xC9, 0x01, 0xEA, 0x1B, 0xF7, 0xCE
-            ];
-
-            public static string Unwrap(string wrappedPlSql)
-            {
-                Match m = Regex.Match(wrappedPlSql, @"wrapped\s*\r?\n(.*\n){19}");
-                int pos = m.Index + m.Length;
-                string base64Str = wrappedPlSql[pos..].TrimEnd();
-
-                int headerSize = 22;
-
-                byte[] data = Convert.FromBase64String(base64Str);
-                for (int i = headerSize; i < data.Length; i++)
-                    data[i] = substitutionTable[data[i]];
-
-                string unwrappedPlSql = "";
-                using (MemoryStream inputStream = new(data, headerSize, data.GetLength(0) - headerSize))
-                using (DeflateStream decompressionStream = new(inputStream, CompressionMode.Decompress))
-                using (StreamReader reader = new(decompressionStream, PlSqlUnwrapper.Encoding))
-                    unwrappedPlSql = reader.ReadToEnd();
-
-                return unwrappedPlSql.TrimEnd('\0');
-            }
-        }
     }
 }
